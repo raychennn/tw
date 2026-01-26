@@ -52,8 +52,8 @@ def check_vcp_criteria(df):
     # 2. VCP Tightness
     atr = ta.atr(high, low, close, length=14).iloc[-1]
     if pd.isna(atr) or atr == 0: return False
-    recent_range = high.tail(15).max() - low.tail(15).min()
-    if recent_range > (atr * 2.5): return False # 修改標準請在此處同步
+    recent_range = high.tail(10).max() - low.tail(10).min()
+    if recent_range > (atr * 3): return False # 修改標準請在此處同步
 
     # 3. 量縮
     vol_sma20 = vol.tail(20).mean()
