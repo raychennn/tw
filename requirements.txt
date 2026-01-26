@@ -1,7 +1,7 @@
-fastapi
-uvicorn
-pyTelegramBotAPI
+python-telegram-bot
 yfinance
 pandas
-apscheduler
-pytz
+pandas_ta
+requests
+lxml
+python-dotenv
