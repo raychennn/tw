@@ -129,14 +129,14 @@ def diagnose_single_stock(df, symbol):
     if pd.isna(atr) or atr == 0:
         return False, "❌ ATR 數值無效 (NaN 或 0)"
 
-    recent_high = high.tail(15).max()
-    recent_low = low.tail(15).min()
+    recent_high = high.tail(10).max()
+    recent_low = low.tail(10).min()
     recent_range = recent_high - recent_low
-    threshold = atr * 2.5 
+    threshold = atr * 3 
     
     report.append(f"\n🔹 **型態收縮 (VCP Tightness)**")
     report.append(f"   ℹ️ ATR(14): {atr:.2f} | 容許震幅: {threshold:.2f}")
-    report.append(f"   ℹ️ 近15日高低差: {recent_range:.2f} (高:{recent_high} 低:{recent_low})")
+    report.append(f"   ℹ️ 近10日高低差: {recent_range:.2f} (高:{recent_high} 低:{recent_low})")
     
     if recent_range <= threshold:
         report.append(f"   ✅ 符合收縮條件")
