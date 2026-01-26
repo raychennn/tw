@@ -64,7 +64,7 @@ def check_vcp_criteria(df):
     # ====================================================
     # 2. VCP Tightness (Close-to-Close, 10 Days, 3.1%)
     # ====================================================
-    recent_closes = close.tail(10)
+    recent_closes = close.tail(5)
     max_c = recent_closes.max()
     min_c = recent_closes.min()
     current_c = close.iloc[-1]
@@ -130,7 +130,7 @@ def diagnose_single_stock(df, symbol):
     # ====================================================
     # 2. 檢查 VCP (Close-to-Close Tightness)
     # ====================================================
-    recent_closes = close.tail(10)
+    recent_closes = close.tail(5)
     max_c = recent_closes.max()
     min_c = recent_closes.min()
     
