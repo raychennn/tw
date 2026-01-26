@@ -210,13 +210,10 @@ async def scan_market(target_date_str):
     except Exception as e:
         print(f"❌ Scan error: {e}")
         return [], target_date_str
-
-# --- E. [新增] 執行單一股票下載與診斷 ---
+# --- E. [修正版] 執行單一股票下載與診斷 ---
 async def fetch_and_diagnose(symbol_input, date_str):
     """
-    下載單一股票數據並診斷
-    symbol_input: "2330" 或 "2330.TW"
-    date_str: "251225"
+    下載單一股票數據並診斷 (強化資料清洗邏輯)
     """
     try:
         # 1. 處理日期
@@ -225,35 +222,65 @@ async def fetch_and_diagnose(symbol_input, date_str):
         end_date = target_date + timedelta(days=1)
         formatted_date = target_date.strftime('%Y-%m-%d')
 
-        # 2. 處理代碼 (自動補後綴)
+        # 2. 處理代碼
         symbol = symbol_input.upper()
+        # 移除可能多餘的空白
+        symbol = symbol.strip()
+        
+        # 智慧判斷後綴
         if not (symbol.endswith('.TW') or symbol.endswith('.TWO')):
-            # 優先猜測是上市
             test_symbol = f"{symbol}.TW"
         else:
             test_symbol = symbol
 
-        # 3. 下載數據
-        # yfinance下載單一股票時，如果不存會回傳 empty dataframe
-        df = yf.download(test_symbol, start=start_date, end=end_date, progress=False)
+        # 3. 下載數據 (強制 auto_adjust=True 以獲得乾淨的 Close)
+        print(f"Debug: Downloading {test_symbol}...")
+        df = yf.download(test_symbol, start=start_date, end=end_date, progress=False, auto_adjust=True)
         
-        # 如果 .TW 沒資料，且原始輸入沒後綴，嘗試 .TWO
+        # 3.1 嘗試上櫃 (.TWO) 的備案
         if df.empty and not (symbol.endswith('.TW') or symbol.endswith('.TWO')):
             test_symbol = f"{symbol}.TWO"
-            df = yf.download(test_symbol, start=start_date, end=end_date, progress=False)
+            print(f"Debug: Retrying with {test_symbol}...")
+            df = yf.download(test_symbol, start=start_date, end=end_date, progress=False, auto_adjust=True)
 
         if df.empty:
-            return False, f"❌ 找不到股票數據: {symbol_input} (日期: {formatted_date})\n可能原因: 休市、代碼錯誤或已下市。", formatted_date
+            return False, f"❌ 找不到股票數據: {symbol_input} (Yahoo Finance 回傳空值)\n請確認代碼是否正確 (例如 6770) 或日期是否過早。", formatted_date
+
+        # ==========================================
+        # 核心修正：資料清洗與欄位標準化
+        # ==========================================
+        
+        # A. 處理 MultiIndex (如果 yfinance 回傳 ('Close', '6770.TW'))
+        if isinstance(df.columns, pd.MultiIndex):
+            # 如果是多層索引，通常第二層是 Ticker，我們只保留第一層 (Open, High...)
+            df.columns = df.columns.get_level_values(0)
+        
+        # B. 統一欄位名稱為首字大寫 (Close, Open...) 避免大小寫錯誤
+        # 有些版本回傳 'adj close', 有些是 'Close'
+        df.columns = [c.capitalize() for c in df.columns]
+        
+        # C. 檢查必要欄位是否存在
+        required_cols = ['Close', 'High', 'Low', 'Volume']
+        if not all(col in df.columns for col in required_cols):
+             return False, f"❌ 數據欄位缺失。\n抓到的欄位: {list(df.columns)}\n缺少必要欄位，可能是資料來源問題。", formatted_date
+
+        # D. 移除 NaN
+        df.dropna(inplace=True)
+        
+        if df.empty: 
+            return False, "❌ 清洗後無有效數據 (全為 NaN)", formatted_date
+        
+        # ==========================================
 
         # 4. 檢查日期對齊
-        df.dropna(inplace=True)
-        if df.empty: return False, "❌ 資料區間內無有效數據", formatted_date
-        
         last_dt = df.index[-1].date()
+        # 容許誤差：如果 target_date 是週日，抓到週五也可以接受 (或是明確告知)
+        # 這裡嚴格比對，若不符則告知
         if last_dt != target_date.date():
-            return False, f"❌ 資料日期不符\n請求: {formatted_date}\n實際最新: {last_dt}\n(可能是當天停牌或假日)", formatted_date
+            return False, f"❌ 資料日期不符\n您的請求: {formatted_date}\n數據最新: {last_dt}\n(可能該日休市或尚未收盤)", formatted_date
 
         # 5. 執行診斷
+        # 傳入清洗過的 df 與 正確的 symbol 名稱
         is_pass, report = diagnose_single_stock(df, test_symbol)
         
         header = f"🔍 **個股診斷報告: {test_symbol}**\n📅 日期: {formatted_date}\n" + "-"*20 + "\n"
@@ -261,5 +288,9 @@ async def fetch_and_diagnose(symbol_input, date_str):
         
         return is_pass, full_report, formatted_date
 
+    except Exception as e:
+        import traceback
+        traceback.print_exc() # 在 Console 印出詳細錯誤
+        return False, f"❌ 程式內部錯誤: {str(e)}", date_str
     except Exception as e:
         return False, f"❌ 診斷發生錯誤: {e}", date_str
