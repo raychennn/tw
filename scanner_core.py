@@ -65,7 +65,7 @@ def check_vcp_criteria(df):
 
     return True
 
-# --- C. [新增] 單一股票診斷邏輯 (詳細報告用) ---
+# --- C. 單一股票診斷邏輯 (修正版: 加入防呆) ---
 def diagnose_single_stock(df, symbol):
     """
     對單一股票進行詳細檢查，回傳報告字串與是否通過
@@ -73,22 +73,38 @@ def diagnose_single_stock(df, symbol):
     report = []
     is_pass = True
     
-    if len(df) < 65:
-        return False, f"❌ 資料不足: 僅 {len(df)} 筆 (需 > 65)"
-
-    close = df['Close']
-    vol = df['Volume']
-    high = df['High']
-    low = df['Low']
+    # 0. 資料基礎檢查
+    # 移除任何包含 NaN 的行，確保計算指標時不會出錯
+    df = df.dropna()
     
-    # 取最後一天的數值
+    if len(df) < 65:
+        return False, f"❌ 資料不足: 有效 K 線僅 {len(df)} 根 (需 > 65 根以計算季線)"
+
+    # 強制轉換型別，避免 yfinance 偶爾回傳 object 導致計算失敗
+    try:
+        close = df['Close'].astype(float)
+        vol = df['Volume'].astype(float)
+        high = df['High'].astype(float)
+        low = df['Low'].astype(float)
+    except Exception as e:
+        return False, f"❌ 數據格式錯誤: 無法轉換為數字 ({e})"
+    
     c_now = close.iloc[-1]
     
     # 1. 檢查 60MA 趨勢
     sma60 = ta.sma(close, length=60)
+    
+    # [防呆] 確保 sma60 不是 None 且資料足夠
+    if sma60 is None or len(sma60.dropna()) < 5:
+        return False, f"❌ 無法計算 60MA (資料長度不足或計算錯誤)"
+
     ma60_now = sma60.iloc[-1]
     ma60_prev = sma60.iloc[-5]
     
+    # [防呆] 再次確認數值不是 NaN
+    if pd.isna(ma60_now) or pd.isna(ma60_prev):
+        return False, "❌ 60MA 計算結果包含無效值 (NaN)"
+
     report.append(f"🔹 **股價與季線 (Trend)**")
     if c_now > ma60_now:
         report.append(f"   ✅ 股價({c_now:.2f}) > 季線({ma60_now:.2f})")
@@ -103,11 +119,20 @@ def diagnose_single_stock(df, symbol):
         is_pass = False
 
     # 2. 檢查 VCP (Tightness)
-    atr = ta.atr(high, low, close, length=14).iloc[-1]
+    atr_series = ta.atr(high, low, close, length=14)
+    
+    # [防呆] 確保 ATR 有算出來
+    if atr_series is None or atr_series.empty:
+        return False, "❌ 無法計算 ATR (波動率指標失敗)"
+        
+    atr = atr_series.iloc[-1]
+    if pd.isna(atr) or atr == 0:
+        return False, "❌ ATR 數值無效 (NaN 或 0)"
+
     recent_high = high.tail(15).max()
     recent_low = low.tail(15).min()
     recent_range = recent_high - recent_low
-    threshold = atr * 2.5  # 注意：這裡要跟上面的標準一致
+    threshold = atr * 2.5 
     
     report.append(f"\n🔹 **型態收縮 (VCP Tightness)**")
     report.append(f"   ℹ️ ATR(14): {atr:.2f} | 容許震幅: {threshold:.2f}")
@@ -139,7 +164,6 @@ def diagnose_single_stock(df, symbol):
 
     final_msg = "\n".join(report)
     return is_pass, final_msg
-
 # --- D. 執行掃描主程式 (維持不變) ---
 async def scan_market(target_date_str):
     try:
