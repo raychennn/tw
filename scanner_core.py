@@ -6,6 +6,11 @@ import asyncio
 import traceback
 from datetime import datetime, timedelta
 
+# --- 全域參數設定 ---
+GAP_THRESHOLD = 0.04  # 跳空重置門檻 (4%)
+VCP_LOOKBACK_DAYS = 10  # 檢查收斂的天數 (原5天，擴大為10天以配合跳空邏輯)
+TIGHTNESS_THRESHOLD = 0.035 # 收斂標準 (放寬至 3.5% 配合 10 天區間)
+
 # --- A. 自動獲取上市櫃清單 ---
 def get_tw_stock_list():
     """從證交所與櫃買中心獲取所有股票代碼，轉為 Yahoo 格式"""
@@ -36,14 +41,39 @@ def get_tw_stock_list():
         return full_list
     except Exception as e:
         print(f"❌ 獲取清單失敗: {e}")
-        # 若爬蟲失敗，回傳權值股當備案
         return ['2330.TW', '2317.TW', '2454.TW']
+
+# --- Helper: Gap Reset 處理邏輯 ---
+def apply_gap_reset_logic(series, gap_threshold=GAP_THRESHOLD):
+    """
+    輸入: 收盤價 Series (例如近 10 日)
+    邏輯: 從最新日期往回推，若發現單日漲跌幅 > 4%，則截斷該日之前的數據。
+    回傳: 截斷後的 Series, 是否發生重置(bool), 重置日期(str)
+    """
+    pct_change = series.pct_change().abs()
+    
+    # 從最後一天往回檢查 (跳過 pct_change 的第一個 NaN)
+    # 我們希望找到"最近一次"的大跳空
+    reset_idx = -1
+    for i in range(len(pct_change) - 1, 0, -1):
+        if pct_change.iloc[i] > gap_threshold:
+            reset_idx = i
+            break
+            
+    if reset_idx != -1:
+        # 重置：保留跳空當日(含)以後的數據
+        # 這樣計算震幅時，是以跳空後的新位階為基準
+        cutoff_date = series.index[reset_idx]
+        new_series = series.iloc[reset_idx:]
+        return new_series, True, cutoff_date.strftime('%Y-%m-%d')
+    
+    return series, False, None
 
 # --- B. VCP 判斷邏輯 (大量掃描用) ---
 def check_vcp_criteria(df):
     """
     大量掃描專用函數: 回傳 True/False
-    策略: Close-to-Close Tightness (10天, 3.1%)
+    策略: 趨勢濾網 + Gap Reset 版的 VCP Tightness
     """
     # 0. 資料長度檢查
     if len(df) < 65: return False
@@ -62,17 +92,26 @@ def check_vcp_criteria(df):
     if sma60.iloc[-1] <= sma60.iloc[-5]: return False # 季線斜率要向上
 
     # ====================================================
-    # 2. VCP Tightness (Close-to-Close, 10 Days, 3.1%)
+    # 2. VCP Tightness (含 Gap Reset)
     # ====================================================
-    recent_closes = close.tail(5)
-    max_c = recent_closes.max()
-    min_c = recent_closes.min()
+    # 取近 N 天收盤價
+    recent_closes = close.tail(VCP_LOOKBACK_DAYS)
+    
+    # 套用跳空重置邏輯
+    effective_closes, _, _ = apply_gap_reset_logic(recent_closes)
+    
+    # 安全檢查：若重置後數據太少(例如剛跳空1天)，則不視為完成收斂
+    if len(effective_closes) < 3: 
+        return False
+
+    max_c = effective_closes.max()
+    min_c = effective_closes.min()
     current_c = close.iloc[-1]
     
     # 計算收盤價震幅百分比
     range_pct = (max_c - min_c) / current_c
     
-    if range_pct > 0.031: # 3.1% 嚴格濾網
+    if range_pct > TIGHTNESS_THRESHOLD: 
         return False
 
     # 3. 成交量 VCP: 近期量縮 (20MA < 60MA)
@@ -128,26 +167,39 @@ def diagnose_single_stock(df, symbol):
         is_pass = False
 
     # ====================================================
-    # 2. 檢查 VCP (Close-to-Close Tightness)
+    # 2. 檢查 VCP (含 Gap Reset 報告)
     # ====================================================
-    recent_closes = close.tail(5)
-    max_c = recent_closes.max()
-    min_c = recent_closes.min()
+    recent_closes = close.tail(VCP_LOOKBACK_DAYS)
+    
+    # 套用跳空重置
+    effective_closes, is_reset, reset_date = apply_gap_reset_logic(recent_closes)
+    
+    max_c = effective_closes.max()
+    min_c = effective_closes.min()
     
     # 計算震幅
     range_val = max_c - min_c
     range_pct = range_val / c_now
-    threshold = 0.031 # 3.1%
-
-    report.append(f"\n🔹 **收盤價收斂 (C-to-C Tightness)**")
-    report.append(f"   ℹ️ 參數: 10天內 | 容許: 3.1% ({threshold*100:.1f}%)")
-    report.append(f"   ℹ️ 近10日收盤區間: {min_c:.2f} ~ {max_c:.2f}")
-    report.append(f"   ℹ️ 實際震幅: {range_pct*100:.2f}%")
     
-    if range_pct <= threshold:
-        report.append(f"   ✅ 符合極致收縮 (< 3.1%)")
+    report.append(f"\n🔹 **收盤價收斂 (C-to-C Tightness)**")
+    if is_reset:
+        report.append(f"   ⚠️ **偵測到跳空!**")
+        report.append(f"   ℹ️ 重置日期: {reset_date} (單日漲跌 > {GAP_THRESHOLD*100}%)")
+        report.append(f"   ℹ️ 計算區間: {reset_date} ~ 今天 (共 {len(effective_closes)} 天)")
     else:
-        report.append(f"   ❌ 震幅過大 ({range_pct*100:.2f}% > 3.1%)")
+        report.append(f"   ℹ️ 區間: 近 {VCP_LOOKBACK_DAYS} 天 (無顯著跳空)")
+
+    report.append(f"   ℹ️ 有效區間高低: {min_c:.2f} ~ {max_c:.2f}")
+    report.append(f"   ℹ️ 實際震幅: {range_pct*100:.2f}% (門檻: {TIGHTNESS_THRESHOLD*100}%)")
+    
+    # 判定
+    if len(effective_closes) < 3:
+        report.append(f"   ❌ 跳空後天數過短 ({len(effective_closes)}天)，需觀察能否守穩")
+        is_pass = False
+    elif range_pct <= TIGHTNESS_THRESHOLD:
+        report.append(f"   ✅ 符合收縮標準")
+    else:
+        report.append(f"   ❌ 震幅過大")
         is_pass = False
 
     # 3. 檢查成交量
@@ -156,9 +208,9 @@ def diagnose_single_stock(df, symbol):
     
     report.append(f"\n🔹 **成交量 (Volume)**")
     if vol_sma20 < vol_sma60:
-        report.append(f"   ✅ 量縮整理")
+        report.append(f"   ✅ 量縮整理 (月均 < 季均)")
     else:
-        report.append(f"   ❌ 量能未縮 (月均量 >= 季均量)")
+        report.append(f"   ❌ 量能未縮")
         is_pass = False
         
     # 4. 流動性
@@ -188,44 +240,36 @@ async def scan_market(target_date_str):
 
         tickers = get_tw_stock_list()
         
-        # 為了避免記憶體溢出，分批處理
         batch_size = 200
         valid_symbols = []
 
         for i in range(0, len(tickers), batch_size):
             batch = tickers[i:i+batch_size]
             try:
-                # auto_adjust=True 確保拿到乾淨的 Close
                 data = yf.download(batch, start=start_date, end=end_date, group_by='ticker', progress=False, threads=True, auto_adjust=True)
                 
                 if data.empty: continue
 
                 for symbol in batch:
                     try:
-                        # 處理 MultiIndex 結構
                         if isinstance(data.columns, pd.MultiIndex):
-                             df = data[symbol].copy()
+                            df = data[symbol].copy()
                         else:
-                             # 單一股票結構不同，但在 bulk download 較少見
-                             continue
+                            continue
 
-                        # 欄位標準化 (防止大小寫問題)
                         df.columns = [c.capitalize() for c in df.columns]
                         
                         df.dropna(inplace=True)
                         if df.empty: continue
                         
-                        # 日期檢核
                         last_dt = df.index[-1].date()
                         if last_dt != target_date.date(): continue
                         
-                        # 執行 VCP 檢查
                         if check_vcp_criteria(df):
                             valid_symbols.append(symbol)
                     except Exception:
                         continue
                 
-                # 讓出 CPU
                 await asyncio.sleep(0.5)
                 
             except Exception as e:
@@ -240,9 +284,6 @@ async def scan_market(target_date_str):
 
 # --- E. 執行單一股票下載與診斷 ---
 async def fetch_and_diagnose(symbol_input, date_str):
-    """
-    下載單一股票數據並診斷 (含資料清洗)
-    """
     try:
         target_date = datetime.strptime(date_str, "%y%m%d")
         start_date = target_date - timedelta(days=250)
@@ -255,11 +296,9 @@ async def fetch_and_diagnose(symbol_input, date_str):
         else:
             test_symbol = symbol
 
-        # 下載 (auto_adjust=True)
         print(f"Debug: Downloading {test_symbol}...")
         df = yf.download(test_symbol, start=start_date, end=end_date, progress=False, auto_adjust=True)
         
-        # 嘗試上櫃備案
         if df.empty and not (symbol.endswith('.TW') or symbol.endswith('.TWO')):
             test_symbol = f"{symbol}.TWO"
             print(f"Debug: Retrying with {test_symbol}...")
@@ -268,29 +307,22 @@ async def fetch_and_diagnose(symbol_input, date_str):
         if df.empty:
             return False, f"❌ 找不到股票數據: {symbol_input}", formatted_date
 
-        # --- 資料清洗與標準化 ---
-        # A. 降維 (MultiIndex -> Single Index)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         
-        # B. 欄位轉首字大寫
         df.columns = [c.capitalize() for c in df.columns]
         
-        # C. 檢查必要欄位
         required_cols = ['Close', 'High', 'Low', 'Volume']
         if not all(col in df.columns for col in required_cols):
              return False, f"❌ 數據欄位缺失: {list(df.columns)}", formatted_date
 
-        # D. 去除 NaN
         df.dropna(inplace=True)
         if df.empty: return False, "❌ 無有效數據", formatted_date
         
-        # E. 日期對齊檢查
         last_dt = df.index[-1].date()
         if last_dt != target_date.date():
             return False, f"❌ 日期不符 (請求:{formatted_date}, 實際:{last_dt})", formatted_date
 
-        # 執行診斷
         is_pass, report = diagnose_single_stock(df, test_symbol)
         
         header = f"🔍 **個股診斷報告: {test_symbol}**\n📅 日期: {formatted_date}\n" + "-"*20 + "\n"
@@ -301,3 +333,11 @@ async def fetch_and_diagnose(symbol_input, date_str):
     except Exception as e:
         traceback.print_exc()
         return False, f"❌ 程式內部錯誤: {str(e)}", date_str
+
+if __name__ == "__main__":
+    # 測試用：直接執行掃描今天
+    # import nest_asyncio
+    # nest_asyncio.apply()
+    # today_str = datetime.now().strftime("%y%m%d")
+    # asyncio.run(scan_market(today_str))
+    pass
