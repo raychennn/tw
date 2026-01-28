@@ -47,54 +47,56 @@ def get_tw_stock_list():
         print(f"❌ 獲取清單失敗: {e}")
         return ['2330.TW', '2317.TW', '2454.TW']
 
-# --- Helper: Gap Reset 核心邏輯 (修正版: 真跳空判定) ---
+# --- Helper: Gap Reset 核心邏輯 (修正版: 取 Gap 與 DayMove 較大者) ---
 def apply_gap_reset_logic(df_slice, gap_threshold=GAP_THRESHOLD):
     """
     輸入: DataFrame (包含 Open, Close)
-    邏輯: 檢查 (今日Open - 昨日Close) / 昨日Close 是否超過門檻
-    回傳: (截斷後的 Close Series, 是否跳空(bool), 跳空日期(str), 跳空幅度(float))
+    邏輯: 
+      1. 判定是否跳空: (今日Open - 昨日Close) > 門檻
+      2. 決定容許值基數: Max(跳空幅度, 當日收盤漲跌幅)
+    回傳: (截斷後的 Close Series, 是否跳空(bool), 跳空日期(str), 計算用幅度(float))
     """
-    # 確保資料按時間排序
     df_slice = df_slice.sort_index()
     
     reset_idx = -1
-    gap_size = 0.0
+    magnitude_size = 0.0 # 用於回傳決定容許門檻的大小
     
-    # 從最後一天往回檢查 (由新到舊)
-    # 注意: 我們需要 i (今天) 和 i-1 (昨天) 進行比較
-    # range(len - 1, 0, -1) 代表從最後一個索引檢查到索引 1
+    # 從最後一天往回檢查
     for i in range(len(df_slice) - 1, 0, -1):
         
         open_today = df_slice.iloc[i]['Open']
+        close_today = df_slice.iloc[i]['Close']
         close_prev = df_slice.iloc[i-1]['Close']
-        date_today = df_slice.index[i]
         
-        # 防止除以 0 錯誤
         if close_prev == 0: continue
             
-        # 計算"真跳空"幅度 (Open vs Prev Close)
-        # 取絕對值，捕捉向上跳空或向下跳空
+        # 1. 計算"真跳空"幅度 (判定是否觸發 Reset 用)
         current_gap = abs((open_today - close_prev) / close_prev)
         
+        # 只有當「開盤跳空」成立時，才視為 Power Play 啟動
         if current_gap > gap_threshold:
             reset_idx = i
-            gap_size = current_gap
+            
+            # 2. 計算"當日收盤漲跌幅" (實體 K 棒幅度)
+            current_day_move = abs((close_today - close_prev) / close_prev)
+            
+            # 3. 取兩者最大值作為「強度指標」
+            # 若跳空 4.5% 但收盤漲 9.9%，則強度為 9.9% -> 容許門檻 10%
+            magnitude_size = max(current_gap, current_day_move)
+            
             break
             
     if reset_idx != -1:
-        # 發現跳空 -> 執行截斷 (Reset)
         cutoff_date = df_slice.index[reset_idx]
-        # 回傳截斷後的 Close Series 供後續計算 VCP
         new_series = df_slice['Close'].iloc[reset_idx:]
-        return new_series, True, cutoff_date.strftime('%Y-%m-%d'), gap_size
+        return new_series, True, cutoff_date.strftime('%Y-%m-%d'), magnitude_size
     
-    # 未發現跳空 -> 回傳原始 Close 數據
     return df_slice['Close'], False, None, 0.0
 
 # --- B. VCP 判斷邏輯 (大量掃描用) ---
 def check_vcp_criteria(df):
     """
-    大量掃描專用函數: 回傳 True/False
+    大量掃描專用函數
     """
     if len(df) < 65: return False
     
@@ -110,23 +112,17 @@ def check_vcp_criteria(df):
     if sma60.iloc[-1] <= sma60.iloc[-5]: return False
 
     # ====================================================
-    # 2. VCP Tightness (修正: 傳入完整 DataFrame 以計算真跳空)
+    # 2. VCP Tightness (含動態門檻)
     # ====================================================
-    # 取得包含 Open/Close 的切片
     recent_df = df.tail(VCP_LOOKBACK_DAYS)
+    effective_closes, is_reset, _, magnitude_size = apply_gap_reset_logic(recent_df)
     
-    # 呼叫修正後的邏輯函數
-    effective_closes, is_reset, _, gap_size = apply_gap_reset_logic(recent_df)
-    
-    # 防呆: 若截斷後 K 線太少 (<3根)，視為形態未完成
     if len(effective_closes) < 3: return False
 
-    # --- 關鍵分流邏輯 ---
     if is_reset:
-        # [路徑 A] 發生 Power Play 跳空
-        dynamic_threshold = math.ceil(gap_size * 100) / 100.0
+        # 使用回傳的 magnitude_size (已取最大值) 進行無條件進位
+        dynamic_threshold = math.ceil(magnitude_size * 100) / 100.0
     else:
-        # [路徑 B] 無跳空 (一般 VCP)
         dynamic_threshold = DEFAULT_TIGHTNESS
 
     max_c = effective_closes.max()
@@ -186,9 +182,9 @@ def diagnose_single_stock(df, symbol):
         report.append(f"   ❌ 季線下彎")
         is_pass = False
 
-    # 2. VCP Tightness 檢查 (修正: 傳入 DataFrame)
+    # 2. VCP Tightness 檢查
     recent_df = df.tail(VCP_LOOKBACK_DAYS)
-    effective_closes, is_reset, reset_date, gap_size = apply_gap_reset_logic(recent_df)
+    effective_closes, is_reset, reset_date, magnitude_size = apply_gap_reset_logic(recent_df)
     
     max_c = effective_closes.max()
     min_c = effective_closes.min()
@@ -197,7 +193,7 @@ def diagnose_single_stock(df, symbol):
     
     # 設定顯示變數
     if is_reset:
-        dynamic_threshold = math.ceil(gap_size * 100) / 100.0
+        dynamic_threshold = math.ceil(magnitude_size * 100) / 100.0
         thresh_str = f"{dynamic_threshold*100:.0f}% (Power Play 動態調整)"
     else:
         dynamic_threshold = DEFAULT_TIGHTNESS
@@ -206,7 +202,8 @@ def diagnose_single_stock(df, symbol):
     report.append(f"\n🔹 **Tightness (收斂)**")
     if is_reset:
         report.append(f"   ⚡ **偵測到跳空 (Power Play)**")
-        report.append(f"   ℹ️ 跳空日期: {reset_date} | 幅度(Open vs PrevClose): {gap_size*100:.2f}%")
+        report.append(f"   ℹ️ 跳空日期: {reset_date}")
+        report.append(f"   ℹ️ 當日最大幅度(Gap vs Move): {magnitude_size*100:.2f}%")
         report.append(f"   ℹ️ 重置後計算區間: {len(effective_closes)} 天")
     else:
         report.append(f"   ℹ️ 一般盤整模式 (近 {VCP_LOOKBACK_DAYS} 天無顯著缺口)")
