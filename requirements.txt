@@ -5,3 +5,4 @@ pandas_ta
 requests
 lxml
 python-dotenv
+math
