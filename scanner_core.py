@@ -10,15 +10,9 @@ from datetime import datetime, timedelta
 # ==========================================
 # ⚙️ 全域參數設定 (Strategy Configuration)
 # ==========================================
-# 1. 基礎 VCP 設定 (一般情況)
-VCP_LOOKBACK_DAYS = 10      # 觀察天數 (配合跳空邏輯，建議維持 10 天)
+VCP_LOOKBACK_DAYS = 10      # 觀察天數
 DEFAULT_TIGHTNESS = 0.035   # 一般盤整的容許震幅 (3.5%)
-
-# 2. Power Play 跳空設定 (特殊情況)
 GAP_THRESHOLD = 0.04        # 判定為跳空的門檻 (4%)
-# 當發生跳空時，容許震幅會自動調整為 ceil(跳空幅度)
-
-# 3. 流動性設定
 MIN_VOLUME_AVG = 500000     # 最小均量 (500張)
 # ==========================================
 
@@ -45,7 +39,6 @@ def get_tw_stock_list():
         stocks_tpex = df_tpex['有價證券代號及名稱'].apply(lambda x: x.split()[0] + ".TWO").tolist()
 
         full_list = stocks_twse + stocks_tpex
-        # 排除 91 開頭 (DR股)
         full_list = [s for s in full_list if not s.startswith('91')]
         
         print(f"✅ 成功獲取 {len(full_list)} 檔台股清單")
@@ -54,57 +47,76 @@ def get_tw_stock_list():
         print(f"❌ 獲取清單失敗: {e}")
         return ['2330.TW', '2317.TW', '2454.TW']
 
-# --- Helper: Gap Reset 核心邏輯 ---
-def apply_gap_reset_logic(series, gap_threshold=GAP_THRESHOLD):
+# --- Helper: Gap Reset 核心邏輯 (修正版: 真跳空判定) ---
+def apply_gap_reset_logic(df_slice, gap_threshold=GAP_THRESHOLD):
     """
-    回傳: (截斷後的 Series, 是否跳空(bool), 跳空日期(str), 跳空幅度(float))
+    輸入: DataFrame (包含 Open, Close)
+    邏輯: 檢查 (今日Open - 昨日Close) / 昨日Close 是否超過門檻
+    回傳: (截斷後的 Close Series, 是否跳空(bool), 跳空日期(str), 跳空幅度(float))
     """
-    pct_change = series.pct_change().abs() # 取絕對值
+    # 確保資料按時間排序
+    df_slice = df_slice.sort_index()
     
     reset_idx = -1
     gap_size = 0.0
     
     # 從最後一天往回檢查 (由新到舊)
-    for i in range(len(pct_change) - 1, 0, -1):
-        if pct_change.iloc[i] > gap_threshold:
+    # 注意: 我們需要 i (今天) 和 i-1 (昨天) 進行比較
+    # range(len - 1, 0, -1) 代表從最後一個索引檢查到索引 1
+    for i in range(len(df_slice) - 1, 0, -1):
+        
+        open_today = df_slice.iloc[i]['Open']
+        close_prev = df_slice.iloc[i-1]['Close']
+        date_today = df_slice.index[i]
+        
+        # 防止除以 0 錯誤
+        if close_prev == 0: continue
+            
+        # 計算"真跳空"幅度 (Open vs Prev Close)
+        # 取絕對值，捕捉向上跳空或向下跳空
+        current_gap = abs((open_today - close_prev) / close_prev)
+        
+        if current_gap > gap_threshold:
             reset_idx = i
-            gap_size = pct_change.iloc[i]
+            gap_size = current_gap
             break
             
     if reset_idx != -1:
         # 發現跳空 -> 執行截斷 (Reset)
-        cutoff_date = series.index[reset_idx]
-        new_series = series.iloc[reset_idx:]
+        cutoff_date = df_slice.index[reset_idx]
+        # 回傳截斷後的 Close Series 供後續計算 VCP
+        new_series = df_slice['Close'].iloc[reset_idx:]
         return new_series, True, cutoff_date.strftime('%Y-%m-%d'), gap_size
     
-    # 未發現跳空 -> 回傳原始數據 (保持原功能)
-    return series, False, None, 0.0
+    # 未發現跳空 -> 回傳原始 Close 數據
+    return df_slice['Close'], False, None, 0.0
 
 # --- B. VCP 判斷邏輯 (大量掃描用) ---
 def check_vcp_criteria(df):
     """
     大量掃描專用函數: 回傳 True/False
     """
-    # 0. 資料長度檢查 (維持不變)
     if len(df) < 65: return False
     
     close = df['Close']
     vol = df['Volume']
     
-    # 1. 趨勢濾網 (維持不變)
+    # 1. 趨勢濾網
     sma60 = ta.sma(close, length=60)
     if sma60 is None or len(sma60.dropna()) < 5: return False
     
     if pd.isna(sma60.iloc[-1]) or pd.isna(sma60.iloc[-5]): return False
-    if close.iloc[-1] < sma60.iloc[-1]: return False  # 價格在季線上
-    if sma60.iloc[-1] <= sma60.iloc[-5]: return False # 季線向上
+    if close.iloc[-1] < sma60.iloc[-1]: return False
+    if sma60.iloc[-1] <= sma60.iloc[-5]: return False
 
     # ====================================================
-    # 2. VCP Tightness (雙軌判定)
+    # 2. VCP Tightness (修正: 傳入完整 DataFrame 以計算真跳空)
     # ====================================================
-    recent_closes = close.tail(VCP_LOOKBACK_DAYS)
+    # 取得包含 Open/Close 的切片
+    recent_df = df.tail(VCP_LOOKBACK_DAYS)
     
-    effective_closes, is_reset, _, gap_size = apply_gap_reset_logic(recent_closes)
+    # 呼叫修正後的邏輯函數
+    effective_closes, is_reset, _, gap_size = apply_gap_reset_logic(recent_df)
     
     # 防呆: 若截斷後 K 線太少 (<3根)，視為形態未完成
     if len(effective_closes) < 3: return False
@@ -112,12 +124,9 @@ def check_vcp_criteria(df):
     # --- 關鍵分流邏輯 ---
     if is_reset:
         # [路徑 A] 發生 Power Play 跳空
-        # 容許震幅 = 無條件進位(跳空幅度)
-        # 例: 跳空 4.2% -> 容許 5.0%
         dynamic_threshold = math.ceil(gap_size * 100) / 100.0
     else:
         # [路徑 B] 無跳空 (一般 VCP)
-        # 嚴格執行原本的設定 (3.5%)
         dynamic_threshold = DEFAULT_TIGHTNESS
 
     max_c = effective_closes.max()
@@ -128,12 +137,12 @@ def check_vcp_criteria(df):
     
     if range_pct > dynamic_threshold: return False
 
-    # 3. 成交量 VCP (維持不變)
+    # 3. 成交量 VCP
     vol_sma20 = vol.tail(20).mean()
     vol_sma60 = vol.tail(60).mean()
     if vol_sma20 >= vol_sma60: return False
     
-    # 4. 流動性濾網 (維持不變)
+    # 4. 流動性濾網
     if vol_sma20 < MIN_VOLUME_AVG: return False
 
     return True
@@ -177,9 +186,9 @@ def diagnose_single_stock(df, symbol):
         report.append(f"   ❌ 季線下彎")
         is_pass = False
 
-    # 2. VCP Tightness 檢查
-    recent_closes = close.tail(VCP_LOOKBACK_DAYS)
-    effective_closes, is_reset, reset_date, gap_size = apply_gap_reset_logic(recent_closes)
+    # 2. VCP Tightness 檢查 (修正: 傳入 DataFrame)
+    recent_df = df.tail(VCP_LOOKBACK_DAYS)
+    effective_closes, is_reset, reset_date, gap_size = apply_gap_reset_logic(recent_df)
     
     max_c = effective_closes.max()
     min_c = effective_closes.min()
@@ -197,10 +206,10 @@ def diagnose_single_stock(df, symbol):
     report.append(f"\n🔹 **Tightness (收斂)**")
     if is_reset:
         report.append(f"   ⚡ **偵測到跳空 (Power Play)**")
-        report.append(f"   ℹ️ 跳空日期: {reset_date} | 幅度: {gap_size*100:.2f}%")
+        report.append(f"   ℹ️ 跳空日期: {reset_date} | 幅度(Open vs PrevClose): {gap_size*100:.2f}%")
         report.append(f"   ℹ️ 重置後計算區間: {len(effective_closes)} 天")
     else:
-        report.append(f"   ℹ️ 一般盤整模式 (近 {VCP_LOOKBACK_DAYS} 天無顯著跳空)")
+        report.append(f"   ℹ️ 一般盤整模式 (近 {VCP_LOOKBACK_DAYS} 天無顯著缺口)")
 
     report.append(f"   ℹ️ 實際震幅: {range_pct*100:.2f}%")
     report.append(f"   ℹ️ 容許門檻: {thresh_str}")
@@ -256,14 +265,12 @@ async def scan_market(target_date_str):
         for i in range(0, len(tickers), batch_size):
             batch = tickers[i:i+batch_size]
             try:
-                # 下載數據
                 data = yf.download(batch, start=start_date, end=end_date, group_by='ticker', progress=False, threads=True, auto_adjust=True)
                 
                 if data.empty: continue
 
                 for symbol in batch:
                     try:
-                        # 資料清洗
                         if isinstance(data.columns, pd.MultiIndex):
                             df = data[symbol].copy()
                         else:
@@ -273,17 +280,14 @@ async def scan_market(target_date_str):
                         df.dropna(inplace=True)
                         if df.empty: continue
                         
-                        # 日期檢核
                         last_dt = df.index[-1].date()
                         if last_dt != target_date.date(): continue
                         
-                        # 核心篩選
                         if check_vcp_criteria(df):
                             valid_symbols.append(symbol)
                     except Exception:
                         continue
                 
-                # 避免請求過快
                 await asyncio.sleep(0.5)
                 
             except Exception as e:
@@ -326,7 +330,7 @@ async def fetch_and_diagnose(symbol_input, date_str):
         
         df.columns = [c.capitalize() for c in df.columns]
         
-        required_cols = ['Close', 'High', 'Low', 'Volume']
+        required_cols = ['Close', 'High', 'Low', 'Volume', 'Open']
         if not all(col in df.columns for col in required_cols):
              return False, f"❌ 數據欄位缺失: {list(df.columns)}", formatted_date
 
